@@ -20,7 +20,6 @@ import time
 import os
 import logging
 import base64
-import shlex
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
@@ -1045,8 +1044,7 @@ class SpikeWindow(QMainWindow):
 
             # Load the composed file into Siril
             try:
-                escaped_composed_filename = shlex.quote(composed_file)
-                SIRIL.cmd(f'load {escaped_composed_filename}')
+                SIRIL.cmd("load" , f'"{composed_filename}"')
                 self.log_current_parameters()
             except Exception as e:
                 logging.warning(f"Could not load {composed_file} into Siril: {e}")
@@ -1265,11 +1263,10 @@ def main():
             new_path = os.path.join(dir_name, new_base)
 
             # Tell Siril to write a 32‑bit TIFF
-            SIRIL.cmd(f'savetif32 "{new_path}" -astro')
+            SIRIL.cmd("savetif32", f'"{new_path}"', "-astro")
 
             # Load the newly created file back into Siril
-            escaped_composed_filename = shlex.quote(new_path)
-            SIRIL.cmd(f'load {escaped_composed_filename}')
+            SIRIL.cmd("load", f'"{new_path}"')
 
             # Now the current image is the TIFF; update the filename
             current_fname = new_path
