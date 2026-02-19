@@ -1044,7 +1044,7 @@ class SpikeWindow(QMainWindow):
 
             # Load the composed file into Siril
             try:
-                SIRIL.cmd("load" , f'"{composed_filename}"')
+                SIRIL.cmd("load" , f'"{composed_file}"')
                 self.log_current_parameters()
             except Exception as e:
                 logging.warning(f"Could not load {composed_file} into Siril: {e}")
