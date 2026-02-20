@@ -22,6 +22,20 @@ import logging
 import base64
 from typing import List, Tuple, Optional, Dict
 
+# Siril imports
+try:
+    import sirilpy as s
+    from sirilpy import NoImageError, SirilError
+    SIRIL = s.SirilInterface()
+    if not SIRIL.connect():
+        logging.error("Failed to connect to Siril. Is Siril running?")
+        sys.exit(1)
+except Exception as e:
+    logging.exception(f"Error initializing Siril interface: {e}")
+    sys.exit(1)
+
+s.ensure_installed("numpy", "scipy", "scikit-image", "pillow", "PyQt6")
+
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from skimage.draw import disk, polygon
@@ -40,18 +54,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF
 from PyQt6.QtGui import QPixmap, QImage, QColor, QPainter, QIcon, QPen
-
-# Siril imports
-try:
-    import sirilpy as s
-    from sirilpy import NoImageError, SirilError
-    SIRIL = s.SirilInterface()
-    if not SIRIL.connect():
-        logging.error("Failed to connect to Siril. Is Siril running?")
-        sys.exit(1)
-except Exception as e:
-    logging.exception(f"Error initializing Siril interface: {e}")
-    sys.exit(1)
 
 # Constants
 VERSION = "1.1.0"
@@ -443,47 +445,84 @@ class SpikeWindow(QMainWindow):
         # -----------------------------------------------------------------
 
         # Helper to create sliders (unchanged)
-        def make_slider(label: str, min_: int, max_: int, init_: int,
-                        unit: str, display_scale: float = 1.0) -> Tuple[QWidget, QSlider]:
+        def make_slider(label: str,
+                min_: int, max_: int, init_: int,
+                unit: str,
+                display_scale: float = 1.0,
+                tooltip: Optional[str] = None) -> Tuple[QWidget, QSlider]:
+            
             sld = QSlider(Qt.Orientation.Horizontal)
             sld.setRange(min_, max_)
             sld.setValue(init_)
 
             val_lbl = QLabel(str(init_))
-            val_lbl.setParent(controls_container)   # use the controls container as parent
-
-            def update_val(val):
-                lbl_text = f"{val / display_scale:.1f}"
-                val_lbl.setText(lbl_text)
-            sld.valueChanged.connect(update_val)
-            sld.valueChanged.connect(self.schedule_preview_update)
-
+            # The container widget that will hold the slider + labels
             w = QWidget()
             lay = QHBoxLayout(w)
             lay.setContentsMargins(0, 0, 0, 0)
+
+            # Unit label (e.g. “px”, “%”)
+            unit_lbl = QLabel(unit)
+
+            # Update the value label when the slider changes
+            def update_val(val):
+                lbl_text = f"{val / display_scale:.1f}"
+                val_lbl.setText(lbl_text)
+
+            sld.valueChanged.connect(update_val)
+            sld.valueChanged.connect(self.schedule_preview_update)
+
+            # ------------------------------------------------------------------
+            # Attach the tooltip to every widget in the row
+            # ------------------------------------------------------------------
+            if tooltip:
+                sld.setToolTip(tooltip)
+                val_lbl.setToolTip(tooltip)
+                unit_lbl.setToolTip(tooltip)
+
             lay.addWidget(sld)
             lay.addWidget(val_lbl)
-            lay.addWidget(QLabel(unit))
+            lay.addWidget(unit_lbl)
+
             return w, sld
 
         # Slider widgets
         self.fwhm_min_lbl, self.fwhm_min_slider = make_slider(
-            "FWHM Min", 5, 40, DEFAULT_CONFIG['FWHM_MIN'], "px")
-        self.fwhm_max_lbl, self.fwhm_max_slider = make_slider(
-            "FWHM Max", 5, DEFAULT_CONFIG['FWHM_MAX_LIMIT'], DEFAULT_CONFIG['FWHM_MAX'], "px")
-        self.length_lbl, self.spike_length_slider = make_slider(
-            "Spike Length", 0, 100, DEFAULT_CONFIG['SPIKE_LENGTH_PCT'], "%")
-        self.thickness_lbl, self.spike_thickness_slider = make_slider(
-            "Spike Thickness", 1, 10, DEFAULT_CONFIG['SPIKE_THICKNESS'], "px")
-        self.blur_lbl, self.blur_sigma_slider = make_slider(
-            "Blur Sigma", 0, 30, int(DEFAULT_CONFIG['BLUR_SIGMA'] * 10), "σ", display_scale=10.0)
-        self.rotation_lbl, self.rotation_slider = make_slider(
-            "Rotation Angle", 0, 360, DEFAULT_CONFIG['ROTATION_ANGLE'], "°")
+            "FWHM Min", 5, 40, DEFAULT_CONFIG['FWHM_MIN'], "px",
+            tooltip="Select the minimum FWHM (in pixels) of stars to be spiked."
+        )
 
-        # --- Transparency slider ---------------------------------------
+        self.fwhm_max_lbl, self.fwhm_max_slider = make_slider(
+            "FWHM Max", 5, DEFAULT_CONFIG['FWHM_MAX_LIMIT'],
+            DEFAULT_CONFIG['FWHM_MAX'], "px",
+            tooltip="Select the maximum FWHM (in pixels) of stars to be spiked."
+        )
+
+        self.length_lbl, self.spike_length_slider = make_slider(
+            "Spike Length", 0, 100, DEFAULT_CONFIG['SPIKE_LENGTH_PCT'], "%",
+            tooltip="Length of each spike as a percentage of the star’s FWHM."
+        )
+
+        self.thickness_lbl, self.spike_thickness_slider = make_slider(
+            "Spike Thickness", 1, 10, DEFAULT_CONFIG['SPIKE_THICKNESS'], "px",
+            tooltip="Base thickness (in pixels) of the spike triangles."
+        )
+
+        self.blur_lbl, self.blur_sigma_slider = make_slider(
+            "Blur Sigma", 0, 30, int(DEFAULT_CONFIG['BLUR_SIGMA'] * 10), "σ",
+            display_scale=10.0,
+            tooltip="Gaussian blur sigma applied to each spike for realism."
+        )
+
+        self.rotation_lbl, self.rotation_slider = make_slider(
+            "Rotation Angle", 0, 360, DEFAULT_CONFIG['ROTATION_ANGLE'], "°",
+            tooltip="Rotate the entire spike pattern around each star."
+        )
+
         self.transparency_lbl, self.transparency_slider = make_slider(
             "Transparency", 0, 100, DEFAULT_CONFIG['TRANSPARENCY'], "%",
-            display_scale=1.0)
+            tooltip="Transparency of the star mask overlay in the preview."
+)
 
         # Colour display box
         self.color_display = QLabel()
@@ -543,7 +582,6 @@ class SpikeWindow(QMainWindow):
         star_layout.addRow("Detected Stars:", self.star_count_label)
         star_group.setLayout(star_layout)
         star_group.setMinimumWidth(280)
-        star_group.setFixedHeight(star_group.sizeHint().height())
 
         # Spike Setting group
         spike_group = QGroupBox("Spike Settings")
@@ -557,19 +595,22 @@ class SpikeWindow(QMainWindow):
         spike_layout.addRow("Spike Color:", color_row_widget)
         spike_group.setLayout(spike_layout)
         spike_group.setMinimumWidth(280)
-        spike_group.setFixedHeight(spike_group.sizeHint().height())
+        spike_group.setMinimumHeight(280)
 
         # Mask Setting group
-        mask_group = QGroupBox("Mask Setting")
+        mask_group = QGroupBox("Mask")
         mask_layout = QFormLayout()
-        mask_layout.addRow("Transparency:", self.transparency_lbl)
+        mask_layout.addRow("Opacity:", self.transparency_lbl)
         mask_group.setLayout(mask_layout)
         mask_group.setMinimumWidth(280)
-        mask_group.setFixedHeight(mask_group.sizeHint().height())
 
         # Add the groups and buttons to the controls layout
         controls_layout.addWidget(star_group)
         controls_layout.addWidget(spike_group)
+        spacer_between = QSpacerItem(
+            0, 20, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
+        )
+        controls_layout.addSpacerItem(spacer_between)
         controls_layout.addWidget(mask_group)
 
         # Fixed spacer between the last group and the buttons
@@ -604,21 +645,18 @@ class SpikeWindow(QMainWindow):
         btn_bar = QHBoxLayout()
         zoom_in_btn = QPushButton("Zoom In")
         zoom_out_btn = QPushButton("Zoom Out")
-        zoom_1to1_btn = QPushButton("1:1")
         fit_view_btn = QPushButton("Fit")
 
         # Fixed size for the zoom buttons
-        for btn in (zoom_in_btn, zoom_out_btn, zoom_1to1_btn, fit_view_btn):
+        for btn in (zoom_in_btn, zoom_out_btn, fit_view_btn):
             btn.setFixedSize(100, 30)
 
         zoom_in_btn.clicked.connect(self.zoom_in)
         zoom_out_btn.clicked.connect(self.zoom_out)
-        zoom_1to1_btn.clicked.connect(self.zoom_1to1)
         fit_view_btn.clicked.connect(self.fit_view)
 
         btn_bar.addWidget(zoom_in_btn)
         btn_bar.addWidget(zoom_out_btn)
-        btn_bar.addWidget(zoom_1to1_btn)
         btn_bar.addWidget(fit_view_btn)
         btn_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)   # keep centered
         preview_layout.addLayout(btn_bar)
@@ -664,10 +702,6 @@ class SpikeWindow(QMainWindow):
     def zoom_out(self):
         """Zoom out by 20%."""
         self.view.scale(1 / 1.2, 1 / 1.2)
-
-    def zoom_1to1(self):
-        """Reset to 100% (no transform)."""
-        self.view.resetTransform()
 
     def fit_view(self):
         """Fit the image inside the view while keeping aspect ratio."""
@@ -1007,7 +1041,7 @@ class SpikeWindow(QMainWindow):
         processed[..., 1] += spikes_mask * color_norm[1]
         processed[..., 2] += spikes_mask * color_norm[2]
 
-        np.clip(processed, 0, 1, out=processed)
+        np.clip(processed, 0.0, 1.0, out=processed)
         processed = np.flipud(processed)  # Vertical mirror for composed image
 
         # Prepare the pure spikes mask (vertically mirrored, white spikes)
@@ -1157,7 +1191,7 @@ class SpikeWindow(QMainWindow):
         <tr><td><code>Rotation Angle (°)</code></td><td>Rotate the whole pattern.</td></tr>
         <tr><td><code>Pattern Shape</code></td><td>Radial, Cross or X.</td></tr>
         <tr><td><code>Spike Color</code></td><td>RGB picker; shown in the small box.</td></tr>
-        <tr><td><code>Transparency (%)</code></td><td>Opacity of the star mask overlay in the preview.</td></tr>
+        <tr><td><code>Opacity (%)</code></td><td>Opacity of the star mask overlay in the preview.</td></tr>
     
         <ul>
         </table>
@@ -1242,6 +1276,7 @@ def main():
     pixmap.loadFromData(icon_data)
     app_icon = QIcon(pixmap)
     app.setWindowIcon(app_icon) 
+    
 
     try:
         # Get the filename of the image currently loaded in Siril
@@ -1259,7 +1294,8 @@ def main():
         try:
             # Build the new filename: <basename>.tif in same directory
             dir_name, base = os.path.split(current_fname)
-            new_base = f"{os.path.splitext(base)[0]}.tif"
+            base_no_ext = os.path.splitext(base)[0]
+            new_base = f"{base_no_ext}.tif"
             new_path = os.path.join(dir_name, new_base)
 
             # Tell Siril to write a 32‑bit TIFF
