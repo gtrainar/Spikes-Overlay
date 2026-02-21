@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: MIT License
 ##############################################
 
-# Version 1.1.0
+# Version 1.1.1
 
 """
 Diffraction Spike Overlay Tool for Siril
@@ -25,7 +25,7 @@ from typing import List, Tuple, Optional, Dict
 # Siril imports
 try:
     import sirilpy as s
-    from sirilpy import NoImageError, SirilError
+    from sirilpy.exceptions import NoImageError, SirilConnectionError
     SIRIL = s.SirilInterface()
     if not SIRIL.connect():
         logging.error("Failed to connect to Siril. Is Siril running?")
@@ -49,28 +49,33 @@ from PyQt6.QtWidgets import (
     QFormLayout, QStatusBar, QMessageBox,
     QFileDialog, QSizePolicy,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QFrame, QColorDialog, QDialog, QTextEdit, QProgressBar, 
+    QColorDialog, QDialog, QTextEdit, QProgressBar, 
     QGroupBox, QScrollArea
 )
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF
-from PyQt6.QtGui import QPixmap, QImage, QColor, QPainter, QIcon, QPen
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtGui import QPixmap, QImage, QColor, QPainter, QIcon 
 
 # Constants
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 DEFAULT_CONFIG = {
     'FWHM_MIN': 20,
     'FWHM_MAX': 300,
-    'FWHM_MAX_LIMIT': 1000,
+    'FWHM_MAX_LIMIT': 999,
     'SPIKE_THICKNESS': 4,
     'SPIKE_COUNT': 4,          # 4, 6 or 8
-    'BLUR_SIGMA': 0.1,         # 0.5 σ
+    'BLUR_SIGMA': 0.5,         # 0.5 σ
     'ROTATION_ANGLE': 0,
     'SPIKE_LENGTH_PCT': 80,
-    'TRANSPARENCY': 0, 
+    'SPIKE_BRIGHTNESS' : 80,
+    'MASK_OPACITY': 0, 
 }
 
-CCHANGELOG = """
+CHANGELOG = """
+Version 1.1.1
+    - Added Spikes brightness, removed space bar toggling
+    - GUI minor fixes
+
 Version 1.1.0
     - GUI Update
     - Live Preview of the spiked-stars mask
@@ -88,7 +93,7 @@ Version 1.0.0 (Initial Release) - Feb 2026
     -Rotation angle
     -Blur sigma for realistic effects
     -Color Customization: Choose spike color with a color picker
-    -Image Formats: Support for FITS, TIFF, PNG, and JPEG formats
+    -Image Formats: Support for FITS, TIFF formats
 
 *Compatibility:
     -Siril Integration: Full compatibility with Siril's image processing pipeline
@@ -199,7 +204,6 @@ def array_to_qimage(arr: np.ndarray) -> QImage:
 def calculate_spike_heights(fwhm: float, spike_length_pct: int, spike_count: int) -> List[float]:
     """
     Calculate heights for each spike based on configuration.
-
     For 8 spikes: alternate long/short (short = 0.7 × long).
     For other counts: all spikes have the same height.
     """
@@ -281,7 +285,7 @@ class PreviewWorker(QThread):
                     continue
                 star_count += 1
 
-                height = fwhm * self.params["spike_length"] / 100.0
+                # height = fwhm * self.params["spike_length"] / 100.0
                 base = max(self.params["spike_thickness"], fwhm / 10.0)
 
                 base_factor = max(self.params["spike_length"] / 100.0, 0.2)
@@ -301,29 +305,30 @@ class PreviewWorker(QThread):
                     self.image[y0:y1, x0:x1], sigma=self.params["blur_sigma"]
                 )
 
-            # ----- Darken the base image according to transparency -----
-            alpha = self.params.get("transparency", 0.0)
-            if alpha > 0:
-                # Multiply by (1 – alpha) to darken everything
-                self.image *= (1.0 - alpha)
+            # ----- Darken the base image according to opacity -----
+            mask_opacity = self.params.get("opacity", 0.0)
+            if mask_opacity > 0:
+                # Multiply by (1 – opacity) to darken everything
+                self.image *= (1.0 - mask_opacity)
 
             # Convert image to float if necessary
             if self.image.dtype.kind != 'f':
                 self.image = self.image.astype(np.float32)
 
             # Add colored spikes
+            brightness = self.params.get("spike_brightness", 1.0)
             color_norm = np.array(self.params["spike_color"], dtype=np.float32) / 255.0
-            self.image[..., 0] += mask * color_norm[0]
-            self.image[..., 1] += mask * color_norm[1]
-            self.image[..., 2] += mask * color_norm[2]
+            self.image[..., 0] += mask * color_norm[0] * brightness
+            self.image[..., 1] += mask * color_norm[1] * brightness
+            self.image[..., 2] += mask * color_norm[2] * brightness
 
             # Clip to valid range
-            np.clip(self.image, 0, 1, out=self.image)
+            np.clip(self.image, 0.0, 1.0, out=self.image)
 
             # Create pixmap
             img = np.flipud(self.image)
             if img.dtype.kind != 'u':
-                img = np.clip(img, 0, 1)
+                img = np.clip(img, 0.0, 1.0)
                 img = (img * 255).astype(np.uint8)
 
             qimg = array_to_qimage(img)
@@ -446,47 +451,53 @@ class SpikeWindow(QMainWindow):
 
         # Helper to create sliders (unchanged)
         def make_slider(label: str,
-                min_: int, max_: int, init_: int,
-                unit: str,
-                display_scale: float = 1.0,
-                tooltip: Optional[str] = None) -> Tuple[QWidget, QSlider]:
-            
+                        min_: int, max_: int, init_: int,
+                        unit: str,
+                        display_scale: float = 1.0,
+                        tooltip: Optional[str] = None) -> Tuple[QWidget, QSlider]:
+            """Create a slider row with a right‑aligned value label and a single space
+            between the number and its unit."""
             sld = QSlider(Qt.Orientation.Horizontal)
             sld.setRange(min_, max_)
             sld.setValue(init_)
+            # Value label: fixed width, right‑aligned
+            if display_scale == 10.0:
+                val_lbl = QLabel(f"{init_/display_scale:.1f}")
+            else:
+                val_lbl = QLabel(str(init_))
 
-            val_lbl = QLabel(str(init_))
-            # The container widget that will hold the slider + labels
-            w = QWidget()
-            lay = QHBoxLayout(w)
-            lay.setContentsMargins(0, 0, 0, 0)
+            # Use a reference width based on the longest expected unit string
+            ref_text = "99px"
+            fixed_width = val_lbl.fontMetrics().horizontalAdvance(ref_text)
+            val_lbl.setFixedWidth(fixed_width)
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
 
-            # Unit label (e.g. “px”, “%”)
+            # Unit label
             unit_lbl = QLabel(unit)
-
-            # Update the value label when the slider changes
             def update_val(val):
-                lbl_text = f"{val / display_scale:.1f}"
+                if display_scale == 10.0:   # blur sigma – one decimal
+                    lbl_text = f"{val / display_scale:.1f}"
+                else:                       # all other sliders – integer
+                    lbl_text = str(int(val / display_scale))
                 val_lbl.setText(lbl_text)
-
             sld.valueChanged.connect(update_val)
             sld.valueChanged.connect(self.schedule_preview_update)
-
-            # ------------------------------------------------------------------
-            # Attach the tooltip to every widget in the row
-            # ------------------------------------------------------------------
             if tooltip:
                 sld.setToolTip(tooltip)
                 val_lbl.setToolTip(tooltip)
                 unit_lbl.setToolTip(tooltip)
-
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            
+            # Layout order: slider | value | space | unit
             lay.addWidget(sld)
             lay.addWidget(val_lbl)
             lay.addWidget(unit_lbl)
-
             return w, sld
 
         # Slider widgets
+        
         self.fwhm_min_lbl, self.fwhm_min_slider = make_slider(
             "FWHM Min", 5, 40, DEFAULT_CONFIG['FWHM_MIN'], "px",
             tooltip="Select the minimum FWHM (in pixels) of stars to be spiked."
@@ -519,10 +530,20 @@ class SpikeWindow(QMainWindow):
             tooltip="Rotate the entire spike pattern around each star."
         )
 
-        self.transparency_lbl, self.transparency_slider = make_slider(
-            "Transparency", 0, 100, DEFAULT_CONFIG['TRANSPARENCY'], "%",
-            tooltip="Transparency of the star mask overlay in the preview."
-)
+        self.brightness_lbl, self.brightness_slider = make_slider(
+            "Brightness", 0, 100, DEFAULT_CONFIG['SPIKE_BRIGHTNESS'], "%",
+            tooltip="Adjust spikes overlay brightness."
+        )
+
+        self.opacity_lbl, self.opacity_slider = make_slider(
+            "Opacity", 0, 100, DEFAULT_CONFIG['MASK_OPACITY'], "%",
+            tooltip="Set the opacity of the star mask overlay in the preview."
+        )
+
+
+        # Connect brightness slider to preview update
+        self.brightness_slider.valueChanged.connect(self.schedule_preview_update)
+
 
         # Colour display box
         self.color_display = QLabel()
@@ -591,16 +612,17 @@ class SpikeWindow(QMainWindow):
         spike_layout.addRow("Number of Spikes:", self.spike_count_combo)
         spike_layout.addRow("Blur Sigma:", self.blur_lbl)
         spike_layout.addRow("Rotation Angle:", self.rotation_lbl)
+        spike_layout.addRow("Brightness:", self.brightness_lbl)
         spike_layout.addRow("Pattern Shape:", self.pattern_combo)
         spike_layout.addRow("Spike Color:", color_row_widget)
         spike_group.setLayout(spike_layout)
         spike_group.setMinimumWidth(280)
-        spike_group.setMinimumHeight(280)
+        spike_group.setMinimumHeight(320)
 
         # Mask Setting group
         mask_group = QGroupBox("Mask")
         mask_layout = QFormLayout()
-        mask_layout.addRow("Opacity:", self.transparency_lbl)
+        mask_layout.addRow("Opacity:", self.opacity_lbl)
         mask_group.setLayout(mask_layout)
         mask_group.setMinimumWidth(280)
 
@@ -658,7 +680,7 @@ class SpikeWindow(QMainWindow):
         btn_bar.addWidget(zoom_in_btn)
         btn_bar.addWidget(zoom_out_btn)
         btn_bar.addWidget(fit_view_btn)
-        btn_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)   # keep centered
+        btn_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview_layout.addLayout(btn_bar)
 
         # --- Graphics view -------------------------------------------
@@ -675,16 +697,6 @@ class SpikeWindow(QMainWindow):
         preview_layout.addWidget(self.view)
 
         self._prev_transform = self.view.transform()
-
-        # Overlay label (kept as a child of the view's viewport)
-        self.overlay_label = QLabel("Original", parent=self.view.viewport())
-        self.overlay_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.overlay_label.setStyleSheet(
-            "background-color: gray; border-radius: 8px;"
-            "color: white; font-weight: bold; font-size: 20pt;"
-        )
-        self.overlay_label.setFixedSize(100, 35)
-        self.overlay_label.hide()
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -888,7 +900,7 @@ class SpikeWindow(QMainWindow):
         self.blur_sigma_slider.setValue(int(DEFAULT_CONFIG['BLUR_SIGMA'] * 10))
         self.rotation_slider.setValue(DEFAULT_CONFIG['ROTATION_ANGLE'])
         self.pattern_combo.setCurrentText("Radial")
-        self.transparency_slider.setValue(DEFAULT_CONFIG['TRANSPARENCY'])
+        self.opacity_slider.setValue(DEFAULT_CONFIG['MASK_OPACITY'])
 
         # Reset color to default white
         self.spike_color = (255, 255, 255)
@@ -919,7 +931,8 @@ class SpikeWindow(QMainWindow):
             "pattern": self.pattern_combo.currentText(),
             "stars_list": self.stars_list,
             "spike_color": self.spike_color,
-            "transparency": self.transparency_slider.value() / 100.0,   # new entry
+            "opacity": self.opacity_slider.value() / 100.0,
+            "spike_brightness": self.brightness_slider.value() / 100.0, 
         }
 
     def _apply_spikes(self, image: np.ndarray) -> Tuple[np.ndarray, int]:
@@ -973,12 +986,14 @@ class SpikeWindow(QMainWindow):
             image = image.astype(np.float32)
 
         color_norm = np.array(params["spike_color"], dtype=np.float32) / 255.0
-        image[..., 0] += mask * color_norm[0]
-        image[..., 1] += mask * color_norm[1]
-        image[..., 2] += mask * color_norm[2]
+        brightness = params.get("spike_brightness", 1.0)
+        image[..., 0] += mask * color_norm[0] * brightness
+        image[..., 1] += mask * color_norm[1] * brightness
+        image[..., 2] += mask * color_norm[2] * brightness
 
-        np.clip(image, 0,
-                1 if image.dtype.kind == 'f' else 65535,
+
+        np.clip(image, 0.0,
+                1.0 if image.dtype.kind == 'f' else 65535,
                 out=image)
 
         return image, star_count
@@ -1028,7 +1043,7 @@ class SpikeWindow(QMainWindow):
             )
 
         # Normalize the mask to 0-1 range
-        spikes_mask = np.clip(spikes_mask, 0, 1)
+        spikes_mask = np.clip(spikes_mask, 0.0, 1.0)
 
         # Create the composed image (original + spikes)
         processed = self.image_orig.copy()
@@ -1037,9 +1052,10 @@ class SpikeWindow(QMainWindow):
 
         # Add colored spikes to the composed image
         color_norm = np.array(params["spike_color"], dtype=np.float32) / 255.0
-        processed[..., 0] += spikes_mask * color_norm[0]
-        processed[..., 1] += spikes_mask * color_norm[1]
-        processed[..., 2] += spikes_mask * color_norm[2]
+        brightness = params.get("spike_brightness", 1.0)
+        processed[..., 0] += spikes_mask * color_norm[0] * brightness
+        processed[..., 1] += spikes_mask * color_norm[1] * brightness
+        processed[..., 2] += spikes_mask * color_norm[2] * brightness
 
         np.clip(processed, 0.0, 1.0, out=processed)
         processed = np.flipud(processed)  # Vertical mirror for composed image
@@ -1083,62 +1099,12 @@ class SpikeWindow(QMainWindow):
             except Exception as e:
                 logging.warning(f"Could not load {composed_file} into Siril: {e}")
 
-            # Show success message with both files
-            QMessageBox.information(
-                self, "Export Complete",
-                f"Successfully saved:\n"
-                f"- Composed image: {composed_file}\n"
-                f"- Pure spikes mask (transparent background): {mask_file}"
-            )
+            SIRIL.log(f"Composed image: {composed_file}")
+            SIRIL.log(f"Spikes mask: {mask_file}")
 
         except Exception as e:
             logging.error(f"Failed to save spiked image: {e}")
             QMessageBox.critical(self, "Export Failed", f"Error saving files:\n{e}")
-
-    def keyPressEvent(self, event):
-
-        if event.isAutoRepeat():
-            return
-
-        if event.key() == Qt.Key.Key_Space:
-            self._prev_transform = self.view.transform()
-
-            if not self.showing_original:
-                self.show_original_image()
-                self.overlay_label.show()
-            else:
-                self.update_preview()
-                self.overlay_label.hide()
-
-            self.showing_original = not self.showing_original
-        else:
-            super().keyPressEvent(event)
-
-    def show_original_image(self):
-        """Show the original image without spikes, preserving zoom."""
-        if self.image_orig is None:
-            return
-        img = self.image_orig.copy()
-        if img.dtype.kind != 'u':
-            if img.dtype.kind == 'f':
-                img = np.clip(img, 0, 1)
-                img = (img * 255).astype(np.uint8)
-            else:
-                img = (img / 256).astype(np.uint8)
-        img = np.flipud(img)
-        qimg = array_to_qimage(img)
-
-        pixmap = QPixmap.fromImage(qimg).scaled(
-            self.view.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        self.scene.clear()
-        item = QGraphicsPixmapItem(pixmap)
-        self.scene.addItem(item)
-        self.scene.setSceneRect(item.boundingRect())
-
-        self.view.setTransform(self._prev_transform)
 
     def resizeEvent(self, event):
         """Debounce preview update when window size changes."""
@@ -1165,7 +1131,7 @@ class SpikeWindow(QMainWindow):
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
 
-        dlg.resize(750, 600)
+        dlg.resize(750, 780)
         dlg.exec()
 
     def help_tab(self) -> QWidget:
@@ -1179,7 +1145,7 @@ class SpikeWindow(QMainWindow):
         and an alpha‑masked PNG that can be opened in GIMP or other editors.</p>
 
 
-        <h2 style="color: #88aaff;">Parameters (Controls)</h2>
+        <h2 style="color: #88aaff;">Controls</h2>
         <table>
         <tr><th>Control</th><th>Description</th></tr>
         <tr><td><code>FWHM Min / Max</code></td><td>Filters stars by their FWHM (px). Only stars within this range are spiked.</td></tr>
@@ -1189,7 +1155,8 @@ class SpikeWindow(QMainWindow):
         <tr><td><code>Number of Spikes</code></td><td>4, 6 or 8 radial spikes per star.</td></tr>
         <tr><td><code>Blur Sigma</code></td><td>Gaussian blur applied to each spike (σ).</td></tr>
         <tr><td><code>Rotation Angle (°)</code></td><td>Rotate the whole pattern.</td></tr>
-        <tr><td><code>Pattern Shape</code></td><td>Radial, Cross or X.</td></tr>
+        <tr><td><code>Brightness</code></td><td>Brightness of the spikes.</td></tr>
+        <tr><td><code>Pattern Shape</code></td><td>Radial, Cross or X.</td></tr>        
         <tr><td><code>Spike Color</code></td><td>RGB picker; shown in the small box.</td></tr>
         <tr><td><code>Opacity (%)</code></td><td>Opacity of the star mask overlay in the preview.</td></tr>
     
@@ -1198,7 +1165,7 @@ class SpikeWindow(QMainWindow):
 
         <h2 style="color: #88aaff;">Workflow</h2>
         <ol>
-        <li><strong>Load an image in Siril.</strong> The script automatically converts it to a 32‑bit TIFF if needed.</li>
+        <li><strong>Load an image in Siril.</strong> The script automatically opens TIFF and FITS images.</li>
         <li><strong>Adjust controls.</strong> The preview updates in real time after each change.</li>
         <li><strong>Verify <code>Detected Stars</code>.</strong> Ensure the list matches the stars you want spiked.</li>
         <li><strong>Use zoom/fit buttons</strong> on the preview pane for a detailed view.</li>
@@ -1211,18 +1178,7 @@ class SpikeWindow(QMainWindow):
         <li>The tool works only on RGB stretched images; grayscale is unsupported.</li>
         <li>Large images may take several seconds to process in the preview; full‑resolution saving is faster because it skips live rendering.</li>
         <li>Star detection uses Siril’s <code>get_image_stars()</code>; if no stars are found the spike generation is skipped.</li>
-        </ul>
-
-        <h2 style="color: #88aaff;">Keyboard Shortcuts</h2>
-        <p><code>Space</code>toggles between the original image and the spiked preview.</p>
-
-        <h2 style="color: #88aaff;">Troubleshooting</h2>
-        <ul>
-        <li><strong>“No image loaded” error:</strong> Make sure an image is open in Siril before launching the tool.</li>
-        <li><strong>“Unsupported image format” error:</strong> The current image must be a 32‑bit RGB TIFF; the script will attempt conversion automatically.</li>
-        <li>Check Siril’s console for detailed error logs if the tool crashes or hangs.</li>
-        </ul>
-        
+        </ul>        
 
         <h4 style="color: #88aaff;">Credits</h4>
         <p>Developed for SIRIL.<br>
@@ -1278,43 +1234,40 @@ def main():
     app.setWindowIcon(app_icon) 
     
 
+    SIRIL.log(f"##############################################")
+    SIRIL.log(f"#  Diffraction Spike Overlay Tool for Siril  #")
+    SIRIL.log(f"##############################################")
+
     try:
         # Get the filename of the image currently loaded in Siril
         current_fname = SIRIL.get_image_filename()
-    except NoImageError:
-        QMessageBox.critical(
+    except SirilConnectionError:
+        # Prompt user to select an image file
+        fname, _ = QFileDialog.getOpenFileName(
             None,
-            "No Image Loaded",
-            "Please open an image in Siril before running this tool."
+            "Select image to load",
+            "",
+            "Images (*.fits *.fit *.tif *.tiff)"
         )
-        return 1
-
-    # If the current image is not a TIFF, convert it to a 32‑bit TIFF
-    if not is_tiff(current_fname):
+        if not fname:
+            QMessageBox.critical(
+                None,
+                "No Image Loaded",
+                "Please open an image in Siril before running this tool."
+            )
+            return 1
         try:
-            # Build the new filename: <basename>.tif in same directory
-            dir_name, base = os.path.split(current_fname)
-            base_no_ext = os.path.splitext(base)[0]
-            new_base = f"{base_no_ext}.tif"
-            new_path = os.path.join(dir_name, new_base)
-
-            # Tell Siril to write a 32‑bit TIFF
-            SIRIL.cmd("savetif32", f'"{new_path}"', "-astro")
-
-            # Load the newly created file back into Siril
-            SIRIL.cmd("load", f'"{new_path}"')
-
-            # Now the current image is the TIFF; update the filename
-            current_fname = new_path
+            SIRIL.cmd("load", f'"{fname}"')
+            current_fname = fname
         except Exception as e:
             QMessageBox.critical(
                 None,
-                "Conversion Failed",
-                f"Could not convert the image to a 32‑bit TIFF:\n{e}"
+                "Load Failed",
+                f"Could not load selected image: {e}"
             )
             return 1
 
-    # Fetch the image (now guaranteed to be a TIFF)
+    # Fetch the image
     try:
         with wait_for_lock(SIRIL):
             ffit = SIRIL.get_image()
